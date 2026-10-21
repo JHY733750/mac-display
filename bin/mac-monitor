@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Turn one of this PC's monitors into a second display for the MacBook Air.
+#
+#   mac-monitor              -> use saved IP + monitor
+#   mac-monitor 192.168.0.4  -> connect to that Mac and save it
+#   mac-monitor -m DP-4      -> use a different monitor for this run
+#
+# Requires on the Mac: BetterDisplay virtual screen + RustDesk with
+# "Enable direct IP access" turned on.
+
+set -euo pipefail
+CONF="$HOME/.config/mac-monitor.conf"
+MONITOR="${MAC_MONITOR:-HDMI-0}"
+MAC_IP=""
+
+[ -f "$CONF" ] && . "$CONF"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--monitor) MONITOR="$2"; shift 2 ;;
+    -l|--list)    xrandr --query | grep " connected"; exit 0 ;;
+    -s|--stop)    pkill -f "rustdesk --connect" && echo "session closed" || echo "no session running"; exit 0 ;;
+    -h|--help)    sed -n '2,10p' "$0"; exit 0 ;;
+    *)            MAC_IP="$1"; shift ;;
+  esac
+done
+
+if [ -z "$MAC_IP" ]; then
+  echo "No Mac IP known yet. Run:  mac-monitor <mac-ip>" >&2
+  echo "(find it on the Mac: System Settings > Wi-Fi > Details)" >&2
+  exit 1
+fi
+
+# geometry of the monitor we are handing over
+GEO=$(xrandr --query | awk -v m="$MONITOR" '$1==m && $2=="connected" {
+        for (i=3;i<=NF;i++) if ($i ~ /^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) { print $i; exit }
+      }')
+if [ -z "$GEO" ]; then
+  echo "Monitor '$MONITOR' not connected. Available:" >&2
+  xrandr --query | grep " connected" >&2
+  exit 1
+fi
+W=${GEO%%x*}; R=${GEO#*x}; H=${R%%+*}; R=${R#*+}; X=${R%%+*}; Y=${R#*+}
+# Remember settings for next time. MAC_NO_SAVE is set when the caller picked a
+# transient address (a DHCP lease on the LAN); the saved identity must stay the
+# stable tailnet one, or a lease change would silently orphan the config.
+if [ -z "${MAC_NO_SAVE:-}" ]; then
+  printf 'MAC_IP=%s\nMONITOR=%s\nMAC_USER=%s\nMAC_MDNS=%s\n' \
+         "$MAC_IP" "$MONITOR" "${MAC_USER:-}" "${MAC_MDNS:-}" > "$CONF"
+fi
+
+echo "Handing $MONITOR (${W}x${H} at ${X},${Y}) to the Mac at $MAC_IP ..."
+
+pgrep -f "rustdesk --connect $MAC_IP" >/dev/null || rustdesk --connect "$MAC_IP" >/dev/null 2>&1 &
+
+# wait for the remote session window, then park it fullscreen on that monitor
+for _ in $(seq 1 60); do
+  WID=$(wmctrl -l | awk -v ip="$MAC_IP" '$0 ~ ip {print $1; exit}')
+  [ -n "$WID" ] && break
+  sleep 1
+done
+
+if [ -z "${WID:-}" ]; then
+  echo "RustDesk window did not appear - connect manually, then press F11 to fullscreen." >&2
+  exit 1
+fi
+
+sleep 2
+wmctrl -i -r "$WID" -b remove,maximized_vert,maximized_horz
+wmctrl -i -r "$WID" -e "0,$X,$Y,$W,$H"
+sleep 1
+wmctrl -i -r "$WID" -b add,fullscreen
+# RustDesk does not remember which remote display was selected - a fresh
+# connection always lands on display 1, the Mac's own screen. Picking display 2
+# is not one click on the toolbar: that control only opens a dropdown, and the
+# real display buttons are inside it. rd-pick-display drives both steps and
+# confirms the switch from the toolbar's own state instead of assuming it worked.
+DISP=${DISPLAY_INDEX:-2}
+if ! "$HOME/bin/rd-pick-display" --display "$DISP" --window "$WID"; then
+  echo "Warning: still on display 1 - pick display $DISP from the RustDesk toolbar by hand." >&2
+fi
+xdotool mousemove $(( X + W / 2 )) $(( Y + H / 2 )) 2>/dev/null
+
+echo "Done. Exit fullscreen with F11, or 'mac-monitor --stop' to close."

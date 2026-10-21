@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# One-click toggle: hand a monitor of this PC to the MacBook, or take it back.
+#
+#   mac-display            toggle (start if off, stop if on)   <- what the icon runs
+#   mac-display --on       force start
+#   mac-display --off      force stop
+#   mac-display --status   print state, exit 0 if a session is live
+#   mac-display --pair-local  one-time: save the password for the LAN address
+#   mac-display -m DP-4    use a different monitor for this run
+#
+# Wraps ~/bin/mac-monitor with a preflight check and desktop notifications so
+# it can be launched from an icon with no terminal attached.
+
+set -uo pipefail
+
+CONF="$HOME/.config/mac-monitor.conf"
+MAC_IP=""; MONITOR=""; MAC_USER="${MAC_USER:-hyeon-yongjeong}"; MAC_MDNS="${MAC_MDNS:-}"
+[ -f "$CONF" ] && . "$CONF"
+
+# A launcher started from GNOME already has these; an SSH shell does not.
+export DISPLAY="${DISPLAY:-:0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+ICON=video-display
+PEERS="$HOME/.config/rustdesk/peers"
+
+# Address selection. MAC_IP is the tailnet address and doubles as the Mac's
+# stable identity; the LAN address is preferred when usable because it keeps the
+# video stream off WireGuard - no userspace encrypt/decrypt per frame and a
+# 1500-byte MTU instead of tailscale's 1280.
+#
+# Latency matters too: tailscale cannot be trusted to peer directly. On
+# 2026-10-20 the Mac routed 192.168.0.0/24 out its Wi-Fi (via 10.100.88.1), its
+# packets to this PC never arrived, and tailscale fell back to the Tokyo DERP
+# relay - 70 ms against 0.5 ms on the cable. A connection this PC opens to the
+# Mac's LAN address still works, because macOS answers on the interface the
+# connection came in on.
+
+saved_lan_addrs() {
+  # Private addresses RustDesk already holds a password for, most recently used
+  # first. Tried before anything tailscale reports, since tailscale only knows
+  # the LAN address while it is peering directly.
+  local f a
+  for f in $(ls -t "$PEERS"/*.toml 2>/dev/null); do
+    a=$(basename "$f" .toml)
+    [[ $a =~ ^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]] && echo "$a"
+  done
+}
+
+lan_addr() {
+  # Tailscale itself knows the LAN address - it is the endpoint it negotiated.
+  local a
+  a=$(tailscale status --json 2>/dev/null | python3 -c '
+import json,sys,ipaddress
+want = sys.argv[1]
+try: d = json.load(sys.stdin)
+except Exception: raise SystemExit
+for p in (d.get("Peer") or {}).values():
+    if want in (p.get("TailscaleIPs") or []):
+        cur = (p.get("CurAddr") or "").rsplit(":", 1)[0]
+        try:
+            if ipaddress.ip_address(cur).is_private: print(cur)
+        except ValueError: pass
+' "$MAC_IP" 2>/dev/null)
+  [ -n "$a" ] && { echo "$a"; return 0; }
+  # Fall back to Bonjour, which survives tailscaled being down.
+  [ -n "$MAC_MDNS" ] && avahi-resolve -4 -n "$MAC_MDNS" 2>/dev/null | awk 'NF==2 {print $2}'
+}
+
+has_credential() {
+  # RustDesk keys saved passwords by peer id, so a credential for the tailnet
+  # address does NOT authenticate the LAN one - copying the file just gets it
+  # cleared. An address without its own stored password would turn the one-click
+  # into a password prompt, so it is not eligible.
+  awk '/^password = \[/{f=1;n=0;next} f&&/^\]/{exit} f&&/[0-9]/{n++} END{exit !(n>0)}' \
+      "$PEERS/$1.toml" 2>/dev/null
+}
+
+reachable() { timeout 2 bash -c "echo > /dev/tcp/$1/21118" 2>/dev/null; }
+
+pick_addr() {
+  local a
+  for a in $(saved_lan_addrs) $(lan_addr); do
+    [ "$a" != "$MAC_IP" ] && has_credential "$a" && reachable "$a" && { echo "$a local"; return; }
+  done
+  echo "$MAC_IP tailnet"
+}
+
+# The address the running session actually connected to - which can differ from
+# what pick_addr would choose now, e.g. a session started while the Mac was off
+# the cable keeps using the tailnet after it comes back.
+session_addr() {
+  local p; p=$(session_pid) || return 1
+  tr '\0' '\n' </proc/$p/cmdline | sed -n '/^--connect$/{n;p;q}'
+}
+
+note() { notify-send -a "MacBook Display" -i "$ICON" "$1" "${2:-}" 2>/dev/null; echo "$1${2:+ - $2}"; }
+
+# A live session = a real rustdesk process holding a --connect argument.
+# Matching on the command line alone also catches the shell that launched us.
+session_pid() {
+  local pid
+  for pid in $(pgrep -f -- '--connect' 2>/dev/null); do
+    [ "$(cat /proc/$pid/comm 2>/dev/null)" = "rustdesk" ] && { echo "$pid"; return 0; }
+  done
+  return 1
+}
+
+codec_server() {
+  # RustDesk on Linux learns which hardware decoders work from its own server
+  # process; with no server, every session falls back to CPU decoding. CPU
+  # decoding falls behind, and falling behind is what sets off the frozen-picture
+  # loop on the Mac. stop-service stays on, so this server accepts no incoming
+  # connections - it only answers the local client's hwcodec query.
+  local pid srv
+  for pid in $(pgrep -x rustdesk 2>/dev/null); do
+    tr '\0' ' ' </proc/$pid/cmdline 2>/dev/null | grep -q -- '--server' && return 0
+  done
+  srv="$HOME/.local/share/logs/RustDesk/server/rustdesk_rCURRENT.log"
+  local before; before=$(grep -ac 'set hwcodec config' "$srv" 2>/dev/null)
+  setsid rustdesk --server </dev/null >/dev/null 2>&1 &
+  # The probe takes ~2 s; a session started before it finishes still decodes on the CPU.
+  for _ in $(seq 1 15); do
+    sleep 1
+    [ "$(grep -ac 'set hwcodec config' "$srv" 2>/dev/null)" != "$before" ] && return 0
+  done
+  note "Hardware decoding not ready" "RustDesk's codec probe did not report; this session may decode on the CPU."
+}
+
+stop() {
+  if session_pid >/dev/null; then
+    pkill -f "rustdesk --connect"
+    note "Display returned" "$MONITOR is this PC's again."
+  else
+    note "Nothing to stop" "No MacBook display session is running."
+  fi
+}
+
+start() {
+  [ -n "$MAC_IP" ] || { note "No Mac configured" "Run: mac-monitor <mac-ip>"; exit 1; }
+
+  # Preflight, and it has to be a hard stop rather than a warning: mac-monitor
+  # drives the RustDesk toolbar with blind xdotool clicks at fixed coordinates.
+  # If the connection never establishes those clicks land on whatever else is
+  # under the pointer, so never launch it unless the Mac is actually answering.
+  if ! ping -c 1 -W 2 "$MAC_IP" >/dev/null 2>&1 && ! ping -c 1 -W 2 "$(lan_addr)" >/dev/null 2>&1; then
+    note "MacBook unreachable" "$MAC_IP does not answer. Is it awake and on the network?"
+    exit 1
+  fi
+  if ! timeout 2 bash -c "echo > /dev/tcp/$MAC_IP/21118" 2>/dev/null; then
+    # RustDesk and BetterDisplay have to be running on the Mac. If this box can
+    # reach it over ssh we start them ourselves; otherwise say what to click.
+    if ssh -o BatchMode=yes -o ConnectTimeout=4 "$MAC_USER@$MAC_IP" true 2>/dev/null; then
+      note "Waking the Mac's side" "Starting RustDesk and BetterDisplay over ssh."
+      ssh -o BatchMode=yes -o ConnectTimeout=6 "$MAC_USER@$MAC_IP" \
+          'open -ga BetterDisplay; open -ga RustDesk' 2>/dev/null
+      for _ in $(seq 1 15); do
+        timeout 1 bash -c "echo > /dev/tcp/$MAC_IP/21118" 2>/dev/null && break
+        sleep 2
+      done
+    fi
+    if ! timeout 2 bash -c "echo > /dev/tcp/$MAC_IP/21118" 2>/dev/null; then
+      note "RustDesk is not listening on the Mac" \
+           "Start RustDesk (and BetterDisplay) there, with Settings > Security > Enable direct IP access."
+      exit 1
+    fi
+  fi
+
+  codec_server
+  read -r ADDR ROUTE <<<"$(pick_addr)"
+  # RustDesk restores its own fullscreen from the window state saved for the
+  # peer, and saves "not fullscreen" whenever a session is killed. Only its own
+  # fullscreen hides the title bar - a window manager fullscreen leaves it, and
+  # shifts the toolbar rd-pick-display has to find - so seed it every time.
+  for p in "$PEERS/$ADDR.toml" "$PEERS/$MAC_IP.toml"; do
+    [ -f "$p" ] && sed -i '/^wm_RemoteDesktop = /s/"isFullscreen":false/"isFullscreen":true/' "$p"
+  done
+  note "Connecting over $ROUTE" "Handing $MONITOR to the MacBook at $ADDR."
+  MAC_MONITOR="$MONITOR" MAC_NO_SAVE=1 MAC_USER="$MAC_USER" MAC_MDNS="$MAC_MDNS" \
+    "$HOME/bin/mac-monitor" ${MONITOR:+-m "$MONITOR"} "$ADDR" >/tmp/mac-display.log 2>&1
+  rc=$?
+  # A LAN attempt that dies is worth one retry on the tailnet: the Mac may have
+  # just moved off this network, or dropped its lease mid-connect.
+  if [ $rc -ne 0 ] && [ "$ADDR" != "$MAC_IP" ]; then
+    note "Local path failed" "Falling back to the tailnet address."
+    ADDR="$MAC_IP"; ROUTE=tailnet
+    MAC_MONITOR="$MONITOR" MAC_NO_SAVE=1 MAC_USER="$MAC_USER" MAC_MDNS="$MAC_MDNS" \
+      "$HOME/bin/mac-monitor" ${MONITOR:+-m "$MONITOR"} "$ADDR" >>/tmp/mac-display.log 2>&1
+    rc=$?
+  fi
+
+  # mac-monitor returning 0 only means a window appeared; a session that failed
+  # authentication shows a window too and then exits. Confirm it is still alive.
+  sleep 3
+  if [ $rc -eq 0 ] && session_pid >/dev/null; then
+    setsid "$HOME/bin/mac-display-watchdog" </dev/null >/dev/null 2>&1 &
+    # Which remote display ended up on screen matters as much as connecting:
+    # landing on display 1 mirrors the Mac instead of extending it.
+    # rd-pick-display exits 0 only once the toolbar shows the wanted display
+    # active, so its status is the answer. The toolbar is still settling right
+    # after a connect, hence the retries.
+    picked=1
+    for _ in 1 2 3; do
+      sleep 3
+      "$HOME/bin/rd-pick-display" --display "${DISPLAY_INDEX:-2}" >>/tmp/mac-display.log 2>&1 && { picked=0; break; }
+    done
+    # Switching displays can drop the window out of fullscreen; end on it.
+    WID=$(xdotool search --name "Remote Desktop - RustDesk" 2>/dev/null | head -1)
+    [ -n "$WID" ] && wmctrl -i -r "$WID" -b add,fullscreen
+    # Ask KWin to stop compositing while the session window is up: compositing
+    # re-draws every frame through its own buffer, which costs up to a refresh
+    # (~17 ms at 60 Hz). Checked 2026-10-20: KWin's Compositing.active went
+    # true -> false when this was set. It may allow tearing; to undo, delete the
+    # property or comment this out.
+    [ -n "$WID" ] && xprop -id "$WID" -f _NET_WM_BYPASS_COMPOSITOR 32c -set _NET_WM_BYPASS_COMPOSITOR 1
+    if [ $picked -eq 0 ]; then
+      note "MacBook display is live" "$MONITOR is showing the Mac's virtual screen, over $ROUTE. Click the icon again to take it back."
+    else
+      note "Connected, but mirroring" "Landed on the Mac's own screen. Pick display ${DISPLAY_INDEX:-2} from the RustDesk toolbar."
+    fi
+  else
+    note "Connection dropped" "RustDesk started but did not stay connected. See /tmp/mac-display.log"
+    exit 1
+  fi
+}
+
+pair_local() {
+  # One-time: RustDesk will only use the LAN path once it has a stored password
+  # for that address, and only the Mac's own password can create one. Open the
+  # connection so it can be typed once with "Remember password" ticked.
+  local lan; lan=$(lan_addr)
+  [ -n "$lan" ] || { echo "No LAN address found for the Mac - is it on this network?" >&2; exit 1; }
+  if has_credential "$lan"; then
+    echo "$lan is already paired; the local path is in use."; exit 0
+  fi
+  reachable "$lan" || { echo "$lan is not answering on 21118 - start RustDesk on the Mac." >&2; exit 1; }
+  echo "Opening RustDesk to $lan."
+  echo "Enter the Mac's RustDesk password and TICK 'Remember password', then close the window."
+  echo "After that the one-click button uses the local network automatically."
+  setsid rustdesk --connect "$lan" </dev/null >/dev/null 2>&1 &
+  exit 0
+}
+
+ACTION=toggle
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pair-local) ACTION=pair; shift ;;
+    --on)      ACTION=on;   shift ;;
+    --off)     ACTION=off;  shift ;;
+    --status)  ACTION=status; shift ;;
+    --route)   ACTION=route; shift ;;   # for the watchdog: "ADDR local|tailnet" a new connect would use
+    -m|--monitor) MONITOR="$2"; shift 2 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+case "$ACTION" in
+  pair)   pair_local ;;
+  on)     stop >/dev/null 2>&1; start ;;
+  off)    stop ;;
+  route)  pick_addr ;;
+  status) if p=$(session_pid); then
+            ADDR=$(session_addr); ROUTE=local; [ "$ADDR" = "$MAC_IP" ] && ROUTE=tailnet
+            echo "on  (rustdesk pid $p, monitor $MONITOR -> $ADDR via $ROUTE)"; exit 0
+          else
+            read -r ADDR ROUTE <<<"$(pick_addr)"
+            echo "off (monitor $MONITOR, would use $ADDR via $ROUTE)"; exit 1
+          fi ;;
+  toggle) if session_pid >/dev/null; then stop; else start; fi ;;
+esac

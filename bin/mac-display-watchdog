@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Reconnect the MacBook display when its picture freezes. Started by
+# mac-display after each successful connect; exits when the session ends.
+#
+# The freeze: this PC's RustDesk falls behind and asks the Mac to refresh. The
+# Mac's video service then restarts about once a second, each time without
+# producing a first frame ("encode fail: no valid frame"), so the picture never
+# updates again while the toolbar stays responsive. Only a reconnect clears it.
+#
+# The trigger is visible here: the client logs "Refresh display N to reduce
+# delay". Every logged session that contains that line (Oct 8 x2, Oct 12 x3)
+# was a freeze, and no session without it was - so one new line is enough.
+# Every action is written to $WLOG so false reconnects can be audited.
+#
+# Second job: a session that started on the tailnet (Mac off the cable, or the
+# LAN check failing) stays there after the cable works again, and the tailnet
+# can mean a 70 ms relay. Once a new connect would go local for 30 s in a row,
+# reconnect over the cable.
+
+set -uo pipefail
+
+LOG="${RD_LOG:-$HOME/.local/share/logs/RustDesk/flutter_ffi/rustdesk_rCURRENT.log}"
+WLOG="$HOME/.local/share/logs/mac-display-watchdog.log"
+PATTERN='to reduce delay'
+
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/mac-display-watchdog.lock"
+flock -n 9 || exit 0
+
+say() { echo "[$(date '+%F %T')] $*" >>"$WLOG"; }
+count() { grep -ac "$PATTERN" "$LOG" 2>/dev/null || true; }
+
+# Match on the process name, not the command line: a shell whose command line
+# merely mentions "rustdesk --connect" must not count as a live session.
+session_alive() {
+  local pid
+  for pid in $(pgrep -x rustdesk 2>/dev/null); do
+    tr '\0' ' ' </proc/$pid/cmdline 2>/dev/null | grep -q -- '--connect' && return 0
+  done
+  return 1
+}
+
+MAC_IP=""
+[ -f "$HOME/.config/mac-monitor.conf" ] && . "$HOME/.config/mac-monitor.conf"
+
+session_addr() {
+  local pid
+  for pid in $(pgrep -x rustdesk 2>/dev/null); do
+    tr '\0' '\n' </proc/$pid/cmdline 2>/dev/null | sed -n '/^--connect$/{n;p;q}'
+  done | head -1
+}
+
+reconnect() {
+  say "$1 - reconnecting"
+  notify-send -a "MacBook Display" -i video-display "$2" "Reconnecting automatically." 2>/dev/null
+  # Release the lock first: the reconnect starts this script's successor.
+  exec 9>&-
+  "$HOME/bin/mac-display" --on >>"$WLOG" 2>&1
+  say "reconnect finished (exit $?)"
+  exit 0
+}
+
+seen=$(count); seen=${seen:-0}
+say "watching $(session_addr) (baseline: $seen refresh lines)"
+
+tick=0; lan_ok=0
+while session_alive; do
+  sleep 3
+  n=$(count); n=${n:-0}
+  # A new connection starts a new log file, so the count can go down.
+  [ "$n" -lt "$seen" ] && seen=$n
+  if [ "$n" -gt "$seen" ]; then
+    reconnect "freeze signature: $(grep -a "$PATTERN" "$LOG" | tail -1 | cut -c2-27,60-)" "Picture froze"
+  fi
+  # The route check costs a TCP probe, so every ~9 s rather than every pass.
+  tick=$(( (tick + 1) % 3 ))
+  if [ $tick -eq 0 ] && [ -n "$MAC_IP" ] && [ "$(session_addr)" = "$MAC_IP" ]; then
+    route=$("$HOME/bin/mac-display" --route 2>/dev/null)
+    case "$route" in
+      *" local") lan_ok=$((lan_ok + 1)) ;;
+      *) lan_ok=0 ;;
+    esac
+    [ $lan_ok -ge 3 ] && reconnect "on tailnet but ${route% local} has answered for ~30 s" "Switching to the cable"
+  fi
+done
+
+say "session ended"

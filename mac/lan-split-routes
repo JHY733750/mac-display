@@ -1,0 +1,33 @@
+#!/bin/sh
+# Keep the cable LAN (192.168.0.0/24) on the cable.
+#
+# With an exit node and "Allow local network access", Tailscale routes every
+# local subnet via the primary service's gateway. Wi-Fi is primary here, so the
+# cable's /24 goes out Wi-Fi to 10.100.88.1 and is lost (confirmed 2026-10-20 by
+# toggling the option and watching the route follow it). Two /25 routes on the
+# cable interface are more specific than Tailscale's /24 and win, without
+# touching Tailscale's route or the service order.
+#
+# Idempotent; launchd runs it at boot and every 10 s. It follows whichever
+# interface holds a 192.168.0.x address, and removes the routes when none does.
+
+NET=192.168.0
+IF=$(ifconfig | awk -v n="$NET." '/^[a-z]/ {i=$1; sub(":", "", i)}
+                                   $1 == "inet" && index($2, n) == 1 {print i; exit}')
+
+for half in 0/25 128/25; do
+  dst="$NET.$half"
+  if [ -n "$IF" ]; then
+    # Interface of the route the kernel would use now: ours if present,
+    # otherwise Tailscale's /24 (en0 or utun).
+    cur=$(route -n get -net "$dst" 2>/dev/null | awk '/interface:/ {print $2}')
+    if [ "$cur" != "$IF" ]; then
+      route -n delete -net "$dst" >/dev/null 2>&1
+      route -n add -net "$dst" -interface "$IF" >/dev/null 2>&1 &&
+        logger -t lan-split-routes "$dst -> $IF (was ${cur:-none})"
+    fi
+  else
+    route -n delete -net "$dst" >/dev/null 2>&1 &&
+      logger -t lan-split-routes "$dst removed: no interface on $NET.0/24"
+  fi
+done

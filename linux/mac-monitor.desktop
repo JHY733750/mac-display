@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=MacBook Display
+Comment=Hand this PC's monitor to the MacBook Air - click again to take it back
+Exec=/home/work/bin/mac-display
+Icon=video-display
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+Actions=Stop;Status;
+
+[Desktop Action Stop]
+Name=Take the monitor back
+Exec=/home/work/bin/mac-display --off
+
+[Desktop Action Status]
+Name=Show status
+Exec=/home/work/bin/mac-display --status
